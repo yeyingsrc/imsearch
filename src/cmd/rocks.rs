@@ -1,7 +1,9 @@
 use anyhow::Result;
 use clap::Parser;
-use indicatif::{ProgressBar, ProgressIterator, ProgressStyle};
+use indicatif::{ParallelProgressIterator, ProgressBar, ProgressIterator, ProgressStyle};
 use log::info;
+use rayon::prelude::*;
+use std::sync::atomic::{AtomicU16, Ordering};
 
 use crate::{config::Opts, db::init_db};
 
@@ -26,11 +28,12 @@ impl SubCommandExtend for UpdateDB {
 
         info!("正在统计特征点信息");
         let pb = ProgressBar::new(rocks.total_features()).with_style(pb_style.clone());
-        let mut map = vec![0u16; rocks.total_images() as usize];
-        for features in rocks.features().progress_with(pb) {
-            let (image_id, _feature_id) = features?;
-            map[image_id as usize] += 1;
-        }
+        let map = (0..rocks.total_images() as usize).map(|_| AtomicU16::new(0)).collect::<Vec<_>>();
+        rocks.features().par_bridge().progress_with(pb).for_each(|features| {
+            if let Ok((image_id, _feature_id)) = features {
+                map[image_id as usize].fetch_add(1, Ordering::Relaxed);
+            }
+        });
 
         let mut tx = db.begin().await?;
 
@@ -46,7 +49,7 @@ impl SubCommandExtend for UpdateDB {
         info!("正在迁移特征点信息");
         let mut total_vector_count = 0;
         for i in (0..map.len()).progress_with(pb) {
-            let vector_count = map[i as usize] as i64;
+            let vector_count = map[i as usize].load(Ordering::Relaxed) as i64;
             total_vector_count += vector_count;
             let i = i as i64;
             sqlx::query!(
